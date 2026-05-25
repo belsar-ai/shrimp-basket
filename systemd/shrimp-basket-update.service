@@ -1,0 +1,24 @@
+[Unit]
+Description=shrimp-basket local quarantine proxy daily cache update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/shrimp-basket --update
+StandardOutput=journal
+StandardError=journal
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/shrimp-basket
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+MemoryMax=256M
+CapabilityBoundingSet=

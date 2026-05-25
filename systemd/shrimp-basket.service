@@ -1,0 +1,26 @@
+[Unit]
+Description=shrimp-basket local quarantine proxy daemon
+Requires=shrimp-basket.socket
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/shrimp-basket
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=10s
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/shrimp-basket
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+MemoryMax=256M
+CapabilityBoundingSet=
