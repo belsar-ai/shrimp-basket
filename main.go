@@ -155,7 +155,7 @@ func filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 	}
 
 	var jsonMeta PyPIJSONResponse
-	if err := json.NewDecoder(resp.Body).Decode(&jsonMeta); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 30*1024*1024)).Decode(&jsonMeta); err != nil {
 		return nil, fmt.Errorf("failed to decode PyPI JSON metadata: %w (failing closed)", err)
 	}
 
@@ -750,7 +750,12 @@ func updatePackageCache(registryType, pkg string) {
 		cacheFile = filepath.Join(cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
 	} else {
 		lockKey = pkg
-		targetUrl = "https://registry.npmjs.org/" + pkg
+		upstreamPath := pkg
+		if strings.Contains(pkg, "/") {
+			parts := strings.SplitN(pkg, "/", 2)
+			upstreamPath = parts[0] + "%2F" + parts[1]
+		}
+		targetUrl = "https://registry.npmjs.org/" + upstreamPath
 		filterFunc = filterNPMIndex
 		cacheFile = filepath.Join(cacheDir, "npm", url.QueryEscape(pkg)+".json")
 	}
@@ -785,6 +790,7 @@ func updatePackageCache(registryType, pkg string) {
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 30*1024*1024))
 	if err != nil {
+		log.Printf("[UPDATE] Failed to read response body for %s: %v", pkg, err)
 		return
 	}
 
