@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"html"
 	"io"
 	"log"
 	"net"
@@ -54,13 +53,6 @@ type PyPIJSONResponse struct {
 		Filename      string    `json:"filename"`
 		UploadTimeIso time.Time `json:"upload_time_iso_8601"`
 	} `json:"releases"`
-}
-
-// PEP691Response represents the PyPI simple JSON response (PEP 691)
-type PEP691Response struct {
-	Meta  map[string]interface{} `json:"meta"`
-	Name  string                 `json:"name"`
-	Files []PEP691File           `json:"files"`
 }
 
 // PEP691File represents file objects in the simple JSON response
@@ -416,103 +408,15 @@ func handlePyPI(w http.ResponseWriter, r *http.Request) {
 
 func servePyPICached(w http.ResponseWriter, r *http.Request, data []byte) {
 	accept := r.Header.Get("Accept")
-	if strings.Contains(accept, "application/vnd.pypi.simple.v1+json") {
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		if r.Method == http.MethodHead {
-			return
-		}
-		w.Write(data)
+	if accept != "" && !strings.Contains(accept, "application/vnd.pypi.simple.v1+json") && !strings.Contains(accept, "*/*") {
+		http.Error(w, "Only application/vnd.pypi.simple.v1+json is supported", http.StatusNotAcceptable)
 		return
 	}
-
-	// HTML representation fallback
-	var pep691 PEP691Response
-	if err := json.Unmarshal(data, &pep691); err != nil {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte("<!DOCTYPE html><html><body>Failed to parse index metadata</body></html>"))
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
 	if r.Method == http.MethodHead {
 		return
 	}
-	fmt.Fprintf(w, "<!DOCTYPE html><html><head><meta name=\"pypi:repository-version\" content=\"1.0\"><title>Links for %s</title></head><body><h1>Links for %s</h1>\n", html.EscapeString(pep691.Name), html.EscapeString(pep691.Name))
-	for _, file := range pep691.Files {
-		pythonAttr := ""
-		if file.RequiresPython != "" {
-			pythonAttr = fmt.Sprintf(" data-requires-python=\"%s\"", html.EscapeString(file.RequiresPython))
-		}
-		
-		yankedAttr := ""
-		if file.Yanked != nil {
-			switch v := file.Yanked.(type) {
-			case bool:
-				if v {
-					yankedAttr = " data-yanked=\"\""
-				}
-			case string:
-				yankedAttr = fmt.Sprintf(" data-yanked=\"%s\"", html.EscapeString(v))
-			}
-		}
-
-		metadataAttr := ""
-		if file.CoreMetadata != nil {
-			switch v := file.CoreMetadata.(type) {
-			case bool:
-				if v {
-					metadataAttr = " data-dist-info-metadata=\"\""
-				}
-			case string:
-				metadataAttr = fmt.Sprintf(" data-dist-info-metadata=\"%s\"", html.EscapeString(v))
-			case map[string]interface{}:
-				// Find preferred hash
-				var hashAlgo, hashVal string
-				for _, algo := range []string{"sha256", "sha384", "sha512"} {
-					if val, ok := v[algo]; ok {
-						if valStr, ok := val.(string); ok {
-							hashAlgo = algo
-							hashVal = valStr
-							break
-						}
-					}
-				}
-				if hashAlgo != "" {
-					metadataAttr = fmt.Sprintf(" data-dist-info-metadata=\"%s=%s\"", html.EscapeString(hashAlgo), html.EscapeString(hashVal))
-				} else {
-					metadataAttr = " data-dist-info-metadata=\"true\""
-				}
-			}
-		}
-		
-		// Build original URL with hash fragments appended if missing
-		href := file.URL
-		if !strings.Contains(href, "#") && len(file.Hashes) > 0 {
-			// Find preferred strong hash algorithm
-			var hashAlgo, hashVal string
-			for _, algo := range []string{"sha256", "sha384", "sha512"} {
-				if val, ok := file.Hashes[algo]; ok {
-					hashAlgo = algo
-					hashVal = val
-					break
-				}
-			}
-			// Fallback to first available hash (including md5/sha1) to maintain consistency with JSON path
-			if hashAlgo == "" {
-				for algo, val := range file.Hashes {
-					hashAlgo = algo
-					hashVal = val
-					break
-				}
-			}
-			if hashAlgo != "" {
-				href = fmt.Sprintf("%s#%s=%s", href, hashAlgo, hashVal)
-			}
-		}
-		
-		fmt.Fprintf(w, "<a href=\"%s\"%s%s%s>%s</a><br/>\n", html.EscapeString(href), pythonAttr, yankedAttr, metadataAttr, html.EscapeString(file.Filename))
-	}
-	w.Write([]byte("</body></html>"))
+	w.Write(data)
 }
 
 func handleNPM(w http.ResponseWriter, r *http.Request) {
