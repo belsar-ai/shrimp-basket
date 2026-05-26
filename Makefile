@@ -15,14 +15,13 @@ install: build
 
 	@printf "==> Installing systemd user units...\n"
 	mkdir -p $(HOME)/.config/systemd/user
-	cp systemd/shrimp-basket.socket $(HOME)/.config/systemd/user/
 	cp systemd/shrimp-basket.service $(HOME)/.config/systemd/user/
 	cp systemd/shrimp-basket-update.service $(HOME)/.config/systemd/user/
 	cp systemd/shrimp-basket-update.timer $(HOME)/.config/systemd/user/
 
-	@printf "==> Activating systemd socket & timer...\n"
+	@printf "==> Activating systemd service & timer...\n"
 	systemctl --user daemon-reload
-	systemctl --user enable --now shrimp-basket.socket
+	systemctl --user enable --now shrimp-basket.service
 	systemctl --user enable --now shrimp-basket-update.timer
 
 	@printf "==> Backing up and configuring NPM global registry in ~/.npmrc...\n"
@@ -75,12 +74,10 @@ install: build
 
 uninstall:
 	@printf "==> Stopping and disabling systemd units...\n"
-	systemctl --user stop shrimp-basket.service 2>/dev/null || true
-	systemctl --user disable --now shrimp-basket.socket 2>/dev/null || true
+	systemctl --user disable --now shrimp-basket.service 2>/dev/null || true
 	systemctl --user disable --now shrimp-basket-update.timer 2>/dev/null || true
-	
+
 	@printf "==> Removing systemd unit files...\n"
-	rm -f $(HOME)/.config/systemd/user/shrimp-basket.socket
 	rm -f $(HOME)/.config/systemd/user/shrimp-basket.service
 	rm -f $(HOME)/.config/systemd/user/shrimp-basket-update.service
 	rm -f $(HOME)/.config/systemd/user/shrimp-basket-update.timer

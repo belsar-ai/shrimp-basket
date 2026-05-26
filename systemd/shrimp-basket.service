@@ -1,6 +1,5 @@
 [Unit]
 Description=shrimp-basket local quarantine proxy daemon
-Requires=shrimp-basket.socket
 After=network.target
 
 [Service]
@@ -24,3 +23,6 @@ MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
 MemoryMax=256M
 CapabilityBoundingSet=
+
+[Install]
+WantedBy=default.target
