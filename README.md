@@ -4,7 +4,7 @@ A local, socket-activated Go quarantine proxy for PyPI and npmjs that mitigates 
 
 ## How it works
 
-1. **Systemd Socket Activation**: Wakes up on-demand when a package manager query hits port `12345`.
+1. **Always-on User Service**: Runs as a systemd user service listening on `127.0.0.1:12345`.
 2. **Metadata Quarantine**: Intercepts requests for package version lists, fetches upstream metadata, and strips any versions published `< 7 days ago`.
 3. **No-Latency File-Based Caching**: Caches filtered indices in `~/.cache/shrimp-basket/`.
 4. **Direct CDN Downloads**: Returns the safe, filtered metadata containing absolute URLs. Package manager clients download binaries (`.whl`/`.tgz`) directly from the official CDNs (PyPI/NPM), consuming zero local proxy storage.
@@ -24,7 +24,7 @@ make install
 
 Verify it running:
 ```bash
-systemctl --user status shrimp-basket.socket
+systemctl --user status shrimp-basket.service
 ```
 
 Read logs:

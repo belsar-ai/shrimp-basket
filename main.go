@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,35 +12,29 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 // --- CONFIGURATION & GLOBALS ---
 const (
 	defaultPort    = "12345"
-	idleTimeout    = 5 * time.Minute
 	quarantineDays = 7
 )
 
 var (
-	cacheDir        string
-	lastRequestTime int64 // atomic unix timestamp
-	activeRequests  int32 // atomic count
-	normPattern     = regexp.MustCompile(`[-_.]+`)
-	pypiClient      = &http.Client{Timeout: 15 * time.Second}
-	npmClient       = &http.Client{Timeout: 15 * time.Second}
-	
+	cacheDir    string
+	normPattern = regexp.MustCompile(`[-_.]+`)
+	pypiClient  = &http.Client{Timeout: 15 * time.Second}
+	npmClient   = &http.Client{Timeout: 15 * time.Second}
+
 	// Input Validation Regexes
 	pypiNameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]{1,214}$`)
 	npmNameRegex  = regexp.MustCompile(`^(@[A-Za-z0-9-_.]+/)?[A-Za-z0-9-_.]+$`)
-	
-	// Single-flight lock for upstream requests. entries in sync.Map are never removed
-	// but memory growth is negligible since it is bounded by the total unique packages
-	// ever queried, and the daemon auto-exits after 5 minutes of inactivity.
+
+	// Single-flight lock for upstream requests. Entries in sync.Map are never
+	// removed; memory growth is bounded by total unique packages ever queried.
 	packageCacheLock sync.Map
 )
 
@@ -73,10 +66,6 @@ func getCacheDir() string {
 		home = os.Getenv("HOME")
 	}
 	return filepath.Join(home, ".cache", "shrimp-basket")
-}
-
-func updateActivity() {
-	atomic.StoreInt64(&lastRequestTime, time.Now().Unix())
 }
 
 // normalizePEP503 normalizes a package name according to PEP 503
@@ -668,101 +657,21 @@ func main() {
 	log.Printf("[START] Starting shrimp-basket quarantine proxy...")
 	log.Printf("[START] Cache Directory: %s", cacheDir)
 
-	updateActivity()
-
-	// systemd socket activation check
-	listenFds := os.Getenv("LISTEN_FDS")
-	listenPid := os.Getenv("LISTEN_PID")
-	var listener net.Listener
-	var err error
-
-	// Validate systemd socket variables if present
-	isSocketActivated := false
-	if listenFds != "" {
-		if listenFds != "1" {
-			log.Fatalf("Unexpected LISTEN_FDS value: %s (only 1 socket activation FD is supported)", listenFds)
-		}
-		if listenPid == strconv.Itoa(os.Getpid()) {
-			isSocketActivated = true
-		} else {
-			log.Printf("[WARNING] LISTEN_PID (%s) does not match current PID (%d). Bypassing socket activation.", listenPid, os.Getpid())
-		}
+	listener, err := net.Listen("tcp", "127.0.0.1:"+defaultPort)
+	if err != nil {
+		log.Fatalf("Failed to listen on 127.0.0.1:%s: %v", defaultPort, err)
 	}
+	log.Printf("[START] Listening on 127.0.0.1:%s", defaultPort)
 
-	if isSocketActivated {
-		// systemd socket activation (FD 3 is the first activated socket descriptor passed)
-		file := os.NewFile(3, "systemd-socket")
-		listener, err = net.FileListener(file)
-		if err != nil {
-			log.Fatalf("Failed to listen on systemd socket: %v", err)
-		}
-		file.Close()
-		log.Printf("[START] Listening on systemd socket (FD 3)")
-	} else {
-		// Normal TCP listener
-		listener, err = net.Listen("tcp", "127.0.0.1:"+defaultPort)
-		if err != nil {
-			log.Fatalf("Failed to listen on 127.0.0.1:%s: %v", defaultPort, err)
-		}
-		log.Printf("[START] Listening on 127.0.0.1:%s", defaultPort)
-	}
-
-	// Standard mux routing
 	mux := http.NewServeMux()
-	
-	// PyPI index endpoint
-	mux.HandleFunc("/simple/", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&activeRequests, 1)
-		updateActivity()
-		defer func() {
-			atomic.AddInt32(&activeRequests, -1)
-			updateActivity()
-		}()
-		handlePyPI(w, r)
-	})
-
-	// NPM index endpoints
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&activeRequests, 1)
-		updateActivity()
-		defer func() {
-			atomic.AddInt32(&activeRequests, -1)
-			updateActivity()
-		}()
-		handleNPM(w, r)
-	})
+	mux.HandleFunc("/simple/", handlePyPI)
+	mux.HandleFunc("/", handleNPM)
 
 	server := &http.Server{
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
-	}
-
-	// Graceful shutdown monitor
-	if isSocketActivated {
-		go func() {
-			for {
-				time.Sleep(10 * time.Second)
-				lastTime := atomic.LoadInt64(&lastRequestTime)
-				active := atomic.LoadInt32(&activeRequests)
-				
-				// NOTE: A minor race window exists here if a new connection is accepted
-				// after checking active == 0 but before server.Shutdown(ctx) runs.
-				// In practice, server.Shutdown handles active connections gracefully,
-				// and if the daemon exits, systemd socket activation will just respawn it.
-				// If we are using systemd socket activation, we exit after idle timeout.
-				if active == 0 && time.Since(time.Unix(lastTime, 0)) > idleTimeout {
-					log.Printf("[SHUTDOWN] Idle timeout reached (%v). Shutting down server gracefully...", idleTimeout)
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					if err := server.Shutdown(ctx); err != nil {
-						log.Printf("Graceful shutdown failed: %v", err)
-					}
-					cancel()
-					return
-				}
-			}
-		}()
 	}
 
 	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
