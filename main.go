@@ -18,8 +18,9 @@ import (
 
 // --- CONFIGURATION & GLOBALS ---
 const (
-	defaultPort    = "12345"
-	quarantineDays = 7
+	defaultPort     = "12345"
+	quarantineDays  = 7
+	maxResponseSize = 128 * 1024 * 1024
 )
 
 var (
@@ -109,7 +110,7 @@ func (p *Proxy) filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 	}
 
 	var jsonMeta PyPIJSONResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 30*1024*1024)).Decode(&jsonMeta); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseSize)).Decode(&jsonMeta); err != nil {
 		return nil, fmt.Errorf("failed to decode PyPI JSON metadata: %w (failing closed)", err)
 	}
 
@@ -342,7 +343,7 @@ func (p *Proxy) handlePyPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 30*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		http.Error(w, "Read Error", http.StatusInternalServerError)
 		return
@@ -445,7 +446,7 @@ func (p *Proxy) handleNPM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 30*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		http.Error(w, "Read Error", http.StatusInternalServerError)
 		return
@@ -516,6 +517,56 @@ func writeCache(cacheFile string, data []byte) {
 	}
 }
 
+// --- CACHE INSPECTION & MAINTENANCE ---
+
+func (p *Proxy) cacheStats(subdir string) (int64, int) {
+	var total int64
+	var count int
+	root := filepath.Join(p.cacheDir, subdir)
+	filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		count++
+		return nil
+	})
+	return total, count
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGT"[exp])
+}
+
+func (p *Proxy) printCacheSize() {
+	npmBytes, npmCount := p.cacheStats("npm")
+	pypiBytes, pypiCount := p.cacheStats("pypi")
+	fmt.Printf("Cache directory: %s\n", p.cacheDir)
+	fmt.Printf("  npm:   %10s  (%d files)\n", humanBytes(npmBytes), npmCount)
+	fmt.Printf("  pypi:  %10s  (%d files)\n", humanBytes(pypiBytes), pypiCount)
+	fmt.Printf("  total: %10s  (%d files)\n", humanBytes(npmBytes+pypiBytes), npmCount+pypiCount)
+}
+
+func (p *Proxy) cleanCache() {
+	for _, sub := range []string{"npm", "pypi"} {
+		dir := filepath.Join(p.cacheDir, sub)
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("Failed to remove %s: %v", dir, err)
+			continue
+		}
+		fmt.Printf("Removed %s\n", dir)
+	}
+}
+
 // --- DAILY UPDATE ROUTINE ---
 
 func (p *Proxy) runDailyUpdate() {
@@ -582,7 +633,7 @@ func (p *Proxy) updatePackageCache(registryType, pkg string) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 30*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		log.Printf("[UPDATE] Failed to read response body for %s: %v", pkg, err)
 		return
@@ -601,6 +652,8 @@ func (p *Proxy) updatePackageCache(registryType, pkg string) {
 
 func main() {
 	updateFlag := flag.Bool("update", false, "Run daily update script and exit")
+	cacheSizeFlag := flag.Bool("cache-size", false, "Print cache size and exit")
+	cacheCleanFlag := flag.Bool("cache-clean", false, "Delete all cached metadata and exit")
 	flag.Parse()
 
 	p := &Proxy{
@@ -610,6 +663,16 @@ func main() {
 
 	if *updateFlag {
 		p.runDailyUpdate()
+		return
+	}
+
+	if *cacheSizeFlag {
+		p.printCacheSize()
+		return
+	}
+
+	if *cacheCleanFlag {
+		p.cleanCache()
 		return
 	}
 
