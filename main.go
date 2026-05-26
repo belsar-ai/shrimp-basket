@@ -25,9 +25,6 @@ import (
 const (
 	defaultPort    = "12345"
 	idleTimeout    = 5 * time.Minute
-	// cacheExpiry = 12h: package crossing the 7d boundary may stay hidden for up to 12h.
-	// The systemd daily timer helps align freshness, reducing the window.
-	cacheExpiry    = 12 * time.Hour
 	quarantineDays = 7
 )
 
@@ -628,13 +625,6 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 // --- CACHING OPERATIONS ---
 
 func readCache(cacheFile string) ([]byte, error) {
-	info, err := os.Stat(cacheFile)
-	if err != nil {
-		return nil, err
-	}
-	if time.Since(info.ModTime()) > cacheExpiry {
-		return nil, fmt.Errorf("cache expired")
-	}
 	return os.ReadFile(cacheFile)
 }
 
