@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -32,11 +31,6 @@ var (
 	// Input Validation Regexes
 	pypiNameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]{1,214}$`)
 	npmNameRegex  = regexp.MustCompile(`^(@[A-Za-z0-9-_.]+/)?[A-Za-z0-9-_.]+$`)
-
-	// Single-flight lock for upstream requests. Entries in sync.Map are never
-	// removed, but growth is bounded by the count of unique packages ever
-	// queried — at ~50 bytes each, fine for a single-user proxy.
-	packageCacheLock sync.Map
 )
 
 // --- STRUCTS FOR PYPI & NPM PARSING ---
@@ -72,13 +66,6 @@ func getCacheDir() string {
 // normalizePEP503 normalizes a package name according to PEP 503
 func normalizePEP503(name string) string {
 	return strings.ToLower(normPattern.ReplaceAllString(name, "-"))
-}
-
-// getPackageLock returns a per-package, registry-scoped mutex
-func getPackageLock(registry, pkg string) *sync.Mutex {
-	key := registry + ":" + pkg
-	lock, _ := packageCacheLock.LoadOrStore(key, &sync.Mutex{})
-	return lock.(*sync.Mutex)
 }
 
 // fetchUpstream executes an HTTP request against an upstream registry.
@@ -327,17 +314,6 @@ func handlePyPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Lock package for single-flight upstream request
-	mu := getPackageLock("pypi", normPkg)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Double check cache after lock acquisition
-	if data, err := readCache(cacheFile); err == nil {
-		servePyPICached(w, r, data)
-		return
-	}
-
 	log.Printf("[FETCH] PyPI upstream index for: %s", normPkg)
 	
 	// Fetch from PyPI simple JSON endpoint
@@ -428,21 +404,6 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 	cacheFile := filepath.Join(cacheDir, "npm", url.QueryEscape(pkg)+".json")
 
 	// Check Cache
-	if data, err := readCache(cacheFile); err == nil {
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodHead {
-			return
-		}
-		w.Write(data)
-		return
-	}
-
-	// Lock package for single-flight upstream request
-	mu := getPackageLock("npm", pkg)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Double check cache after lock acquisition
 	if data, err := readCache(cacheFile); err == nil {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodHead {
@@ -563,16 +524,13 @@ func updatePackageCache(registryType, pkg string) {
 	var targetUrl string
 	var filterFunc func(string, []byte) ([]byte, error)
 	var cacheFile string
-	var lockKey string
 
 	if registryType == "pypi" {
 		normPkg := normalizePEP503(pkg)
-		lockKey = normPkg
 		targetUrl = fmt.Sprintf("https://pypi.org/simple/%s/", normPkg)
 		filterFunc = filterPyPIIndex
 		cacheFile = filepath.Join(cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
 	} else {
-		lockKey = pkg
 		upstreamPath := pkg
 		if strings.Contains(pkg, "/") {
 			parts := strings.SplitN(pkg, "/", 2)
@@ -582,10 +540,6 @@ func updatePackageCache(registryType, pkg string) {
 		filterFunc = filterNPMIndex
 		cacheFile = filepath.Join(cacheDir, "npm", url.QueryEscape(pkg)+".json")
 	}
-
-	mu := getPackageLock(registryType, lockKey)
-	mu.Lock()
-	defer mu.Unlock()
 
 	req, _ := http.NewRequest("GET", targetUrl, nil)
 	if registryType == "pypi" {
