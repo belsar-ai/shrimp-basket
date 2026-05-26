@@ -80,27 +80,12 @@ func getPackageLock(registry, pkg string) *sync.Mutex {
 	return lock.(*sync.Mutex)
 }
 
-// fetchWithRetry executes an HTTP request with a single retry on transient failures
-func fetchWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
+// fetchUpstream executes an HTTP request against an upstream registry.
+// No retry layer: every package manager (pip, npm, uv, yarn, pnpm) already
+// retries on its own, and stacking retries multiplies upstream load on outage.
+func fetchUpstream(client *http.Client, req *http.Request) (*http.Response, error) {
 	req.Header.Set("User-Agent", "shrimp-basket/1.0.0")
-	var lastErr error
-	for i := 0; i < 2; i++ {
-		if i > 0 {
-			time.Sleep(500 * time.Millisecond)
-		}
-		
-		resp, err := client.Do(req)
-		if err == nil {
-			if resp.StatusCode < 500 {
-				return resp, nil
-			}
-			resp.Body.Close()
-			lastErr = fmt.Errorf("upstream returned server error status: %d", resp.StatusCode)
-		} else {
-			lastErr = err
-		}
-	}
-	return nil, lastErr
+	return client.Do(req)
 }
 
 // --- CORE FILTERING LOGIC ---
@@ -119,7 +104,7 @@ func filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 	// and skip this second upstream fetch to /json.
 	// Fetch publish dates from PyPI JSON API
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://pypi.org/pypi/%s/json", normPkg), nil)
-	resp, err := fetchWithRetry(pypiClient, req)
+	resp, err := fetchUpstream(pypiClient, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch release dates (failing closed): %w", err)
 	}
@@ -358,7 +343,7 @@ func handlePyPI(w http.ResponseWriter, r *http.Request) {
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://pypi.org/simple/%s/", normPkg), nil)
 	req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-	resp, err := fetchWithRetry(pypiClient, req)
+	resp, err := fetchUpstream(pypiClient, req)
 	if err != nil {
 		log.Printf("Upstream PyPI request error: %v", err)
 		http.Error(w, "Gateway Error", http.StatusBadGateway)
@@ -476,7 +461,7 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 	}
 	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/"+upstreamPath, nil)
 
-	resp, err := fetchWithRetry(npmClient, req)
+	resp, err := fetchUpstream(npmClient, req)
 	if err != nil {
 		log.Printf("Upstream NPM request error: %v", err)
 		http.Error(w, "Gateway Error", http.StatusBadGateway)
@@ -609,9 +594,9 @@ func updatePackageCache(registryType, pkg string) {
 	var resp *http.Response
 	var err error
 	if registryType == "pypi" {
-		resp, err = fetchWithRetry(pypiClient, req)
+		resp, err = fetchUpstream(pypiClient, req)
 	} else {
-		resp, err = fetchWithRetry(npmClient, req)
+		resp, err = fetchUpstream(npmClient, req)
 	}
 
 	if err != nil {
