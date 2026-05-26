@@ -1,8 +1,0 @@
-[Unit]
-Description=shrimp-basket local quarantine proxy socket
-
-[Socket]
-ListenStream=127.0.0.1:12345
-
-[Install]
-WantedBy=sockets.target

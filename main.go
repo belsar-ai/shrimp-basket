@@ -1,11 +1,9 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"html"
 	"io"
 	"log"
 	"net"
@@ -14,40 +12,29 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
 // --- CONFIGURATION & GLOBALS ---
 const (
 	defaultPort    = "12345"
-	idleTimeout    = 5 * time.Minute
-	// cacheExpiry = 12h: package crossing the 7d boundary may stay hidden for up to 12h.
-	// The systemd daily timer helps align freshness, reducing the window.
-	cacheExpiry    = 12 * time.Hour
 	quarantineDays = 7
 )
 
 var (
-	cacheDir        string
-	lastRequestTime int64 // atomic unix timestamp
-	activeRequests  int32 // atomic count
-	normPattern     = regexp.MustCompile(`[-_.]+`)
-	pypiClient      = &http.Client{Timeout: 15 * time.Second}
-	npmClient       = &http.Client{Timeout: 15 * time.Second}
-	
-	// Input Validation Regexes
+	normPattern   = regexp.MustCompile(`[-_.]+`)
 	pypiNameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]{1,214}$`)
 	npmNameRegex  = regexp.MustCompile(`^(@[A-Za-z0-9-_.]+/)?[A-Za-z0-9-_.]+$`)
-	
-	// Single-flight lock for upstream requests. entries in sync.Map are never removed
-	// but memory growth is negligible since it is bounded by the total unique packages
-	// ever queried, and the daemon auto-exits after 5 minutes of inactivity.
-	packageCacheLock sync.Map
 )
+
+// Proxy bundles the shared dependencies (HTTP client, cache directory) used
+// by the registry handlers and the daily update routine. Tests construct
+// their own Proxy with a mock transport instead of mutating package globals.
+type Proxy struct {
+	httpClient *http.Client
+	cacheDir   string
+}
 
 // --- STRUCTS FOR PYPI & NPM PARSING ---
 
@@ -57,13 +44,6 @@ type PyPIJSONResponse struct {
 		Filename      string    `json:"filename"`
 		UploadTimeIso time.Time `json:"upload_time_iso_8601"`
 	} `json:"releases"`
-}
-
-// PEP691Response represents the PyPI simple JSON response (PEP 691)
-type PEP691Response struct {
-	Meta  map[string]interface{} `json:"meta"`
-	Name  string                 `json:"name"`
-	Files []PEP691File           `json:"files"`
 }
 
 // PEP691File represents file objects in the simple JSON response
@@ -86,49 +66,23 @@ func getCacheDir() string {
 	return filepath.Join(home, ".cache", "shrimp-basket")
 }
 
-func updateActivity() {
-	atomic.StoreInt64(&lastRequestTime, time.Now().Unix())
-}
-
 // normalizePEP503 normalizes a package name according to PEP 503
 func normalizePEP503(name string) string {
 	return strings.ToLower(normPattern.ReplaceAllString(name, "-"))
 }
 
-// getPackageLock returns a per-package, registry-scoped mutex
-func getPackageLock(registry, pkg string) *sync.Mutex {
-	key := registry + ":" + pkg
-	lock, _ := packageCacheLock.LoadOrStore(key, &sync.Mutex{})
-	return lock.(*sync.Mutex)
-}
-
-// fetchWithRetry executes an HTTP request with a single retry on transient failures
-func fetchWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
+// fetchUpstream executes an HTTP request against an upstream registry.
+// No retry layer: every package manager (pip, npm, uv, yarn, pnpm) already
+// retries on its own, and stacking retries multiplies upstream load on outage.
+func (p *Proxy) fetchUpstream(req *http.Request) (*http.Response, error) {
 	req.Header.Set("User-Agent", "shrimp-basket/1.0.0")
-	var lastErr error
-	for i := 0; i < 2; i++ {
-		if i > 0 {
-			time.Sleep(500 * time.Millisecond)
-		}
-		
-		resp, err := client.Do(req)
-		if err == nil {
-			if resp.StatusCode < 500 {
-				return resp, nil
-			}
-			resp.Body.Close()
-			lastErr = fmt.Errorf("upstream returned server error status: %d", resp.StatusCode)
-		} else {
-			lastErr = err
-		}
-	}
-	return nil, lastErr
+	return p.httpClient.Do(req)
 }
 
 // --- CORE FILTERING LOGIC ---
 
 // filterPyPIIndex filters a PEP 691 JSON simple index, preserving all unknown fields (PEP 740, etc.)
-func filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
+func (p *Proxy) filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 	var rawIndex map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawIndex); err != nil {
 		return nil, err
@@ -141,7 +95,7 @@ func filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 	// and skip this second upstream fetch to /json.
 	// Fetch publish dates from PyPI JSON API
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://pypi.org/pypi/%s/json", normPkg), nil)
-	resp, err := fetchWithRetry(pypiClient, req)
+	resp, err := p.fetchUpstream(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch release dates (failing closed): %w", err)
 	}
@@ -237,8 +191,10 @@ func filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 	return json.Marshal(rawIndex)
 }
 
-// filterNPMIndex filters an NPM registry index, preserving all unknown fields
-func filterNPMIndex(pkg string, data []byte) ([]byte, error) {
+// filterNPMIndex filters an NPM registry index, preserving all unknown fields.
+// Pointer receiver kept for consistency with filterPyPIIndex so method values
+// of either can be assigned to the filterFunc variable in updatePackageCache.
+func (p *Proxy) filterNPMIndex(pkg string, data []byte) ([]byte, error) {
 	var rawIndex map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawIndex); err != nil {
 		return nil, err
@@ -332,7 +288,7 @@ func filterNPMIndex(pkg string, data []byte) ([]byte, error) {
 
 // --- HTTP SERVER HANDLERS ---
 
-func handlePyPI(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) handlePyPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -355,32 +311,21 @@ func handlePyPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	normPkg := normalizePEP503(pkg)
-	cacheFile := filepath.Join(cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
-	
+	cacheFile := filepath.Join(p.cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
+
 	// Check Cache
 	if data, err := readCache(cacheFile); err == nil {
 		servePyPICached(w, r, data)
 		return
 	}
 
-	// Lock package for single-flight upstream request
-	mu := getPackageLock("pypi", normPkg)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Double check cache after lock acquisition
-	if data, err := readCache(cacheFile); err == nil {
-		servePyPICached(w, r, data)
-		return
-	}
-
 	log.Printf("[FETCH] PyPI upstream index for: %s", normPkg)
-	
+
 	// Fetch from PyPI simple JSON endpoint
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://pypi.org/simple/%s/", normPkg), nil)
 	req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-	resp, err := fetchWithRetry(pypiClient, req)
+	resp, err := p.fetchUpstream(req)
 	if err != nil {
 		log.Printf("Upstream PyPI request error: %v", err)
 		http.Error(w, "Gateway Error", http.StatusBadGateway)
@@ -404,7 +349,7 @@ func handlePyPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Filter and fail closed if filtering fails
-	filteredBody, err := filterPyPIIndex(normPkg, body)
+	filteredBody, err := p.filterPyPIIndex(normPkg, body)
 	if err != nil {
 		log.Printf("Filtering error (failing closed): %v", err)
 		http.Error(w, "Gateway Quarantine Error", http.StatusBadGateway)
@@ -419,106 +364,18 @@ func handlePyPI(w http.ResponseWriter, r *http.Request) {
 
 func servePyPICached(w http.ResponseWriter, r *http.Request, data []byte) {
 	accept := r.Header.Get("Accept")
-	if strings.Contains(accept, "application/vnd.pypi.simple.v1+json") {
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		if r.Method == http.MethodHead {
-			return
-		}
-		w.Write(data)
+	if accept != "" && !strings.Contains(accept, "application/vnd.pypi.simple.v1+json") && !strings.Contains(accept, "*/*") {
+		http.Error(w, "Only application/vnd.pypi.simple.v1+json is supported", http.StatusNotAcceptable)
 		return
 	}
-
-	// HTML representation fallback
-	var pep691 PEP691Response
-	if err := json.Unmarshal(data, &pep691); err != nil {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte("<!DOCTYPE html><html><body>Failed to parse index metadata</body></html>"))
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
 	if r.Method == http.MethodHead {
 		return
 	}
-	fmt.Fprintf(w, "<!DOCTYPE html><html><head><meta name=\"pypi:repository-version\" content=\"1.0\"><title>Links for %s</title></head><body><h1>Links for %s</h1>\n", html.EscapeString(pep691.Name), html.EscapeString(pep691.Name))
-	for _, file := range pep691.Files {
-		pythonAttr := ""
-		if file.RequiresPython != "" {
-			pythonAttr = fmt.Sprintf(" data-requires-python=\"%s\"", html.EscapeString(file.RequiresPython))
-		}
-		
-		yankedAttr := ""
-		if file.Yanked != nil {
-			switch v := file.Yanked.(type) {
-			case bool:
-				if v {
-					yankedAttr = " data-yanked=\"\""
-				}
-			case string:
-				yankedAttr = fmt.Sprintf(" data-yanked=\"%s\"", html.EscapeString(v))
-			}
-		}
-
-		metadataAttr := ""
-		if file.CoreMetadata != nil {
-			switch v := file.CoreMetadata.(type) {
-			case bool:
-				if v {
-					metadataAttr = " data-dist-info-metadata=\"\""
-				}
-			case string:
-				metadataAttr = fmt.Sprintf(" data-dist-info-metadata=\"%s\"", html.EscapeString(v))
-			case map[string]interface{}:
-				// Find preferred hash
-				var hashAlgo, hashVal string
-				for _, algo := range []string{"sha256", "sha384", "sha512"} {
-					if val, ok := v[algo]; ok {
-						if valStr, ok := val.(string); ok {
-							hashAlgo = algo
-							hashVal = valStr
-							break
-						}
-					}
-				}
-				if hashAlgo != "" {
-					metadataAttr = fmt.Sprintf(" data-dist-info-metadata=\"%s=%s\"", html.EscapeString(hashAlgo), html.EscapeString(hashVal))
-				} else {
-					metadataAttr = " data-dist-info-metadata=\"true\""
-				}
-			}
-		}
-		
-		// Build original URL with hash fragments appended if missing
-		href := file.URL
-		if !strings.Contains(href, "#") && len(file.Hashes) > 0 {
-			// Find preferred strong hash algorithm
-			var hashAlgo, hashVal string
-			for _, algo := range []string{"sha256", "sha384", "sha512"} {
-				if val, ok := file.Hashes[algo]; ok {
-					hashAlgo = algo
-					hashVal = val
-					break
-				}
-			}
-			// Fallback to first available hash (including md5/sha1) to maintain consistency with JSON path
-			if hashAlgo == "" {
-				for algo, val := range file.Hashes {
-					hashAlgo = algo
-					hashVal = val
-					break
-				}
-			}
-			if hashAlgo != "" {
-				href = fmt.Sprintf("%s#%s=%s", href, hashAlgo, hashVal)
-			}
-		}
-		
-		fmt.Fprintf(w, "<a href=\"%s\"%s%s%s>%s</a><br/>\n", html.EscapeString(href), pythonAttr, yankedAttr, metadataAttr, html.EscapeString(file.Filename))
-	}
-	w.Write([]byte("</body></html>"))
+	w.Write(data)
 }
 
-func handleNPM(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) handleNPM(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -549,24 +406,9 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheFile := filepath.Join(cacheDir, "npm", url.QueryEscape(pkg)+".json")
+	cacheFile := filepath.Join(p.cacheDir, "npm", url.QueryEscape(pkg)+".json")
 
 	// Check Cache
-	if data, err := readCache(cacheFile); err == nil {
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodHead {
-			return
-		}
-		w.Write(data)
-		return
-	}
-
-	// Lock package for single-flight upstream request
-	mu := getPackageLock("npm", pkg)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Double check cache after lock acquisition
 	if data, err := readCache(cacheFile); err == nil {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodHead {
@@ -586,7 +428,7 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 	}
 	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/"+upstreamPath, nil)
 
-	resp, err := fetchWithRetry(npmClient, req)
+	resp, err := p.fetchUpstream(req)
 	if err != nil {
 		log.Printf("Upstream NPM request error: %v", err)
 		http.Error(w, "Gateway Error", http.StatusBadGateway)
@@ -609,7 +451,7 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filteredBody, err := filterNPMIndex(pkg, body)
+	filteredBody, err := p.filterNPMIndex(pkg, body)
 	if err != nil {
 		log.Printf("NPM Filtering error (failing closed): %v", err)
 		http.Error(w, "Gateway Quarantine Error", http.StatusBadGateway)
@@ -628,13 +470,6 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 // --- CACHING OPERATIONS ---
 
 func readCache(cacheFile string) ([]byte, error) {
-	info, err := os.Stat(cacheFile)
-	if err != nil {
-		return nil, err
-	}
-	if time.Since(info.ModTime()) > cacheExpiry {
-		return nil, fmt.Errorf("cache expired")
-	}
 	return os.ReadFile(cacheFile)
 }
 
@@ -645,138 +480,97 @@ func writeCache(cacheFile string, data []byte) {
 		return
 	}
 
-	os.MkdirAll(filepath.Dir(cacheFile), 0755)
-	
-	// Atomic Cache Write using temp file + Rename. Saves cache files with 0600 permissions.
-	tmpFile := cacheFile + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
-		log.Printf("Failed to write temporary cache: %v", err)
+	dir := filepath.Dir(cacheFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("Failed to create cache directory: %v", err)
 		return
 	}
-	if err := os.Rename(tmpFile, cacheFile); err != nil {
+
+	// Atomic cache write via unique temp file in the same directory + Rename.
+	// Unique names (vs cacheFile + ".tmp") avoid corruption when two requests
+	// for the same package race into writeCache concurrently.
+	tmp, err := os.CreateTemp(dir, "cache-*.tmp")
+	if err != nil {
+		log.Printf("Failed to create temporary cache file: %v", err)
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		log.Printf("Failed to chmod temporary cache: %v", err)
+		tmp.Close()
+		return
+	}
+	if _, err := tmp.Write(data); err != nil {
+		log.Printf("Failed to write temporary cache: %v", err)
+		tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		log.Printf("Failed to close temporary cache: %v", err)
+		return
+	}
+	if err := os.Rename(tmpName, cacheFile); err != nil {
 		log.Printf("Failed to commit cache atomically: %v", err)
-		os.Remove(tmpFile)
-	}
-}
-
-// --- STARTUP CACHE SWEEP ---
-
-func cleanupOrphanedTmpFiles() {
-	// Clean pypi temp files
-	pypiTmp, _ := filepath.Glob(filepath.Join(cacheDir, "pypi", "*.tmp"))
-	for _, f := range pypiTmp {
-		os.Remove(f)
-	}
-	
-	// Clean npm temp files
-	npmTmp, _ := filepath.Glob(filepath.Join(cacheDir, "npm", "*.tmp"))
-	for _, f := range npmTmp {
-		os.Remove(f)
-	}
-}
-
-func evictOldCacheFiles() {
-	maxAge := 30 * 24 * time.Hour
-
-	// Evict old PyPI cache files
-	pypiFiles, _ := filepath.Glob(filepath.Join(cacheDir, "pypi", "*.json"))
-	for _, file := range pypiFiles {
-		if info, err := os.Stat(file); err == nil {
-			if time.Since(info.ModTime()) > maxAge {
-				log.Printf("[EVICTION] Removing stale PyPI cache: %s", file)
-				os.Remove(file)
-			}
-		}
-	}
-
-	// Evict old NPM cache files
-	npmFiles, _ := filepath.Glob(filepath.Join(cacheDir, "npm", "*.json"))
-	for _, file := range npmFiles {
-		if info, err := os.Stat(file); err == nil {
-			if time.Since(info.ModTime()) > maxAge {
-				log.Printf("[EVICTION] Removing stale NPM cache: %s", file)
-				os.Remove(file)
-			}
-		}
 	}
 }
 
 // --- DAILY UPDATE ROUTINE ---
 
-func runDailyUpdate() {
-	cacheDir = getCacheDir()
-	log.Printf("Starting daily metadata cache update in: %s", cacheDir)
+func (p *Proxy) runDailyUpdate() {
+	log.Printf("Starting daily metadata cache update in: %s", p.cacheDir)
 
-	// Run cleanup on old cache files first
-	evictOldCacheFiles()
-
-	// Update PyPI Cache
-	pypiFiles, _ := filepath.Glob(filepath.Join(cacheDir, "pypi", "*.json"))
+	pypiFiles, _ := filepath.Glob(filepath.Join(p.cacheDir, "pypi", "*.json"))
 	for _, file := range pypiFiles {
 		escapedPkg := strings.TrimSuffix(filepath.Base(file), ".json")
 		pkg, err := url.QueryUnescape(escapedPkg)
 		if err == nil {
-			updatePackageCache("pypi", pkg)
-			time.Sleep(50 * time.Millisecond) // Fast but rate-limited sleep
+			p.updatePackageCache("pypi", pkg)
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 
-	// Update NPM Cache
-	npmFiles, _ := filepath.Glob(filepath.Join(cacheDir, "npm", "*.json"))
+	npmFiles, _ := filepath.Glob(filepath.Join(p.cacheDir, "npm", "*.json"))
 	for _, file := range npmFiles {
 		escapedPkg := strings.TrimSuffix(filepath.Base(file), ".json")
 		pkg, err := url.QueryUnescape(escapedPkg)
 		if err == nil {
-			updatePackageCache("npm", pkg)
-			time.Sleep(50 * time.Millisecond) // Fast but rate-limited sleep
+			p.updatePackageCache("npm", pkg)
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	cleanupOrphanedTmpFiles()
 	log.Printf("Daily update complete.")
 }
 
-func updatePackageCache(registryType, pkg string) {
+func (p *Proxy) updatePackageCache(registryType, pkg string) {
 	log.Printf("[UPDATE] Fetching latest metadata for: %s (%s)", pkg, registryType)
 	var targetUrl string
 	var filterFunc func(string, []byte) ([]byte, error)
 	var cacheFile string
-	var lockKey string
 
 	if registryType == "pypi" {
 		normPkg := normalizePEP503(pkg)
-		lockKey = normPkg
 		targetUrl = fmt.Sprintf("https://pypi.org/simple/%s/", normPkg)
-		filterFunc = filterPyPIIndex
-		cacheFile = filepath.Join(cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
+		filterFunc = p.filterPyPIIndex
+		cacheFile = filepath.Join(p.cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
 	} else {
-		lockKey = pkg
 		upstreamPath := pkg
 		if strings.Contains(pkg, "/") {
 			parts := strings.SplitN(pkg, "/", 2)
 			upstreamPath = parts[0] + "%2F" + parts[1]
 		}
 		targetUrl = "https://registry.npmjs.org/" + upstreamPath
-		filterFunc = filterNPMIndex
-		cacheFile = filepath.Join(cacheDir, "npm", url.QueryEscape(pkg)+".json")
+		filterFunc = p.filterNPMIndex
+		cacheFile = filepath.Join(p.cacheDir, "npm", url.QueryEscape(pkg)+".json")
 	}
-
-	mu := getPackageLock(registryType, lockKey)
-	mu.Lock()
-	defer mu.Unlock()
 
 	req, _ := http.NewRequest("GET", targetUrl, nil)
 	if registryType == "pypi" {
 		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 	}
 
-	var resp *http.Response
-	var err error
-	if registryType == "pypi" {
-		resp, err = fetchWithRetry(pypiClient, req)
-	} else {
-		resp, err = fetchWithRetry(npmClient, req)
-	}
-
+	resp, err := p.fetchUpstream(req)
 	if err != nil {
 		log.Printf("Update request failed for %s: %v", pkg, err)
 		return
@@ -809,114 +603,34 @@ func main() {
 	updateFlag := flag.Bool("update", false, "Run daily update script and exit")
 	flag.Parse()
 
-	// Initialize cache dir location globally
-	cacheDir = getCacheDir()
+	p := &Proxy{
+		httpClient: &http.Client{Timeout: 15 * time.Second},
+		cacheDir:   getCacheDir(),
+	}
 
 	if *updateFlag {
-		runDailyUpdate()
+		p.runDailyUpdate()
 		return
 	}
 
-	cleanupOrphanedTmpFiles()
-
 	log.Printf("[START] Starting shrimp-basket quarantine proxy...")
-	log.Printf("[START] Cache Directory: %s", cacheDir)
+	log.Printf("[START] Cache Directory: %s", p.cacheDir)
 
-	updateActivity()
-
-	// systemd socket activation check
-	listenFds := os.Getenv("LISTEN_FDS")
-	listenPid := os.Getenv("LISTEN_PID")
-	var listener net.Listener
-	var err error
-
-	// Validate systemd socket variables if present
-	isSocketActivated := false
-	if listenFds != "" {
-		if listenFds != "1" {
-			log.Fatalf("Unexpected LISTEN_FDS value: %s (only 1 socket activation FD is supported)", listenFds)
-		}
-		if listenPid == strconv.Itoa(os.Getpid()) {
-			isSocketActivated = true
-		} else {
-			log.Printf("[WARNING] LISTEN_PID (%s) does not match current PID (%d). Bypassing socket activation.", listenPid, os.Getpid())
-		}
+	listener, err := net.Listen("tcp", "127.0.0.1:"+defaultPort)
+	if err != nil {
+		log.Fatalf("Failed to listen on 127.0.0.1:%s: %v", defaultPort, err)
 	}
+	log.Printf("[START] Listening on 127.0.0.1:%s", defaultPort)
 
-	if isSocketActivated {
-		// systemd socket activation (FD 3 is the first activated socket descriptor passed)
-		file := os.NewFile(3, "systemd-socket")
-		listener, err = net.FileListener(file)
-		if err != nil {
-			log.Fatalf("Failed to listen on systemd socket: %v", err)
-		}
-		file.Close()
-		log.Printf("[START] Listening on systemd socket (FD 3)")
-	} else {
-		// Normal TCP listener
-		listener, err = net.Listen("tcp", "127.0.0.1:"+defaultPort)
-		if err != nil {
-			log.Fatalf("Failed to listen on 127.0.0.1:%s: %v", defaultPort, err)
-		}
-		log.Printf("[START] Listening on 127.0.0.1:%s", defaultPort)
-	}
-
-	// Standard mux routing
 	mux := http.NewServeMux()
-	
-	// PyPI index endpoint
-	mux.HandleFunc("/simple/", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&activeRequests, 1)
-		updateActivity()
-		defer func() {
-			atomic.AddInt32(&activeRequests, -1)
-			updateActivity()
-		}()
-		handlePyPI(w, r)
-	})
-
-	// NPM index endpoints
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&activeRequests, 1)
-		updateActivity()
-		defer func() {
-			atomic.AddInt32(&activeRequests, -1)
-			updateActivity()
-		}()
-		handleNPM(w, r)
-	})
+	mux.HandleFunc("/simple/", p.handlePyPI)
+	mux.HandleFunc("/", p.handleNPM)
 
 	server := &http.Server{
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
-	}
-
-	// Graceful shutdown monitor
-	if isSocketActivated {
-		go func() {
-			for {
-				time.Sleep(10 * time.Second)
-				lastTime := atomic.LoadInt64(&lastRequestTime)
-				active := atomic.LoadInt32(&activeRequests)
-				
-				// NOTE: A minor race window exists here if a new connection is accepted
-				// after checking active == 0 but before server.Shutdown(ctx) runs.
-				// In practice, server.Shutdown handles active connections gracefully,
-				// and if the daemon exits, systemd socket activation will just respawn it.
-				// If we are using systemd socket activation, we exit after idle timeout.
-				if active == 0 && time.Since(time.Unix(lastTime, 0)) > idleTimeout {
-					log.Printf("[SHUTDOWN] Idle timeout reached (%v). Shutting down server gracefully...", idleTimeout)
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					if err := server.Shutdown(ctx); err != nil {
-						log.Printf("Graceful shutdown failed: %v", err)
-					}
-					cancel()
-					return
-				}
-			}
-		}()
 	}
 
 	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
