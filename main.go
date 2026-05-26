@@ -553,56 +553,11 @@ func writeCache(cacheFile string, data []byte) {
 	}
 }
 
-// --- STARTUP CACHE SWEEP ---
-
-func cleanupOrphanedTmpFiles() {
-	// Clean pypi temp files
-	pypiTmp, _ := filepath.Glob(filepath.Join(cacheDir, "pypi", "*.tmp"))
-	for _, f := range pypiTmp {
-		os.Remove(f)
-	}
-	
-	// Clean npm temp files
-	npmTmp, _ := filepath.Glob(filepath.Join(cacheDir, "npm", "*.tmp"))
-	for _, f := range npmTmp {
-		os.Remove(f)
-	}
-}
-
-func evictOldCacheFiles() {
-	maxAge := 30 * 24 * time.Hour
-
-	// Evict old PyPI cache files
-	pypiFiles, _ := filepath.Glob(filepath.Join(cacheDir, "pypi", "*.json"))
-	for _, file := range pypiFiles {
-		if info, err := os.Stat(file); err == nil {
-			if time.Since(info.ModTime()) > maxAge {
-				log.Printf("[EVICTION] Removing stale PyPI cache: %s", file)
-				os.Remove(file)
-			}
-		}
-	}
-
-	// Evict old NPM cache files
-	npmFiles, _ := filepath.Glob(filepath.Join(cacheDir, "npm", "*.json"))
-	for _, file := range npmFiles {
-		if info, err := os.Stat(file); err == nil {
-			if time.Since(info.ModTime()) > maxAge {
-				log.Printf("[EVICTION] Removing stale NPM cache: %s", file)
-				os.Remove(file)
-			}
-		}
-	}
-}
-
 // --- DAILY UPDATE ROUTINE ---
 
 func runDailyUpdate() {
 	cacheDir = getCacheDir()
 	log.Printf("Starting daily metadata cache update in: %s", cacheDir)
-
-	// Run cleanup on old cache files first
-	evictOldCacheFiles()
 
 	// Update PyPI Cache
 	pypiFiles, _ := filepath.Glob(filepath.Join(cacheDir, "pypi", "*.json"))
@@ -625,7 +580,6 @@ func runDailyUpdate() {
 			time.Sleep(50 * time.Millisecond) // Fast but rate-limited sleep
 		}
 	}
-	cleanupOrphanedTmpFiles()
 	log.Printf("Daily update complete.")
 }
 
@@ -710,8 +664,6 @@ func main() {
 		runDailyUpdate()
 		return
 	}
-
-	cleanupOrphanedTmpFiles()
 
 	log.Printf("[START] Starting shrimp-basket quarantine proxy...")
 	log.Printf("[START] Cache Directory: %s", cacheDir)
