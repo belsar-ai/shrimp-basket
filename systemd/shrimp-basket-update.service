@@ -20,5 +20,5 @@ RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
-MemoryMax=256M
+MemoryMax=512M
 CapabilityBoundingSet=

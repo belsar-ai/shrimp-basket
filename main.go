@@ -523,12 +523,14 @@ func (p *Proxy) cacheStats(subdir string) (int64, int) {
 	var total int64
 	var count int
 	root := filepath.Join(p.cacheDir, subdir)
-	filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
+	filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
 			return nil
 		}
-		total += info.Size()
-		count++
+		if info, err := d.Info(); err == nil {
+			total += info.Size()
+			count++
+		}
 		return nil
 	})
 	return total, count
