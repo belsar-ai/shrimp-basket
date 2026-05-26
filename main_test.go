@@ -157,9 +157,10 @@ func TestFilterNPMIndexCases(t *testing.T) {
 		},
 	}
 
+	p := &Proxy{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			output, err := filterNPMIndex(tt.pkgName, []byte(tt.inputJSON))
+			output, err := p.filterNPMIndex(tt.pkgName, []byte(tt.inputJSON))
 			if tt.expectError {
 				if err == nil {
 					t.Errorf("expected error, got nil")
@@ -203,16 +204,17 @@ func TestFilterPyPIIndex(t *testing.T) {
 		}
 	}`
 
-	oldTransport := pypiClient.Transport
-	defer func() { pypiClient.Transport = oldTransport }()
-
-	pypiClient.Transport = &mockTransport{
-		roundTrip: func(req *http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewBufferString(mockJSONResponse)),
-				Header:     make(http.Header),
-			}, nil
+	p := &Proxy{
+		httpClient: &http.Client{
+			Transport: &mockTransport{
+				roundTrip: func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(bytes.NewBufferString(mockJSONResponse)),
+						Header:     make(http.Header),
+					}, nil
+				},
+			},
 		},
 	}
 
@@ -236,7 +238,7 @@ func TestFilterPyPIIndex(t *testing.T) {
 		]
 	}`
 
-	outputBytes, err := filterPyPIIndex("foo", []byte(simpleIndex))
+	outputBytes, err := p.filterPyPIIndex("foo", []byte(simpleIndex))
 	if err != nil {
 		t.Fatalf("filterPyPIIndex failed: %v", err)
 	}

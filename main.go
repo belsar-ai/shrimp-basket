@@ -23,15 +23,18 @@ const (
 )
 
 var (
-	cacheDir    string
-	normPattern = regexp.MustCompile(`[-_.]+`)
-	pypiClient  = &http.Client{Timeout: 15 * time.Second}
-	npmClient   = &http.Client{Timeout: 15 * time.Second}
-
-	// Input Validation Regexes
+	normPattern   = regexp.MustCompile(`[-_.]+`)
 	pypiNameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]{1,214}$`)
 	npmNameRegex  = regexp.MustCompile(`^(@[A-Za-z0-9-_.]+/)?[A-Za-z0-9-_.]+$`)
 )
+
+// Proxy bundles the shared dependencies (HTTP client, cache directory) used
+// by the registry handlers and the daily update routine. Tests construct
+// their own Proxy with a mock transport instead of mutating package globals.
+type Proxy struct {
+	httpClient *http.Client
+	cacheDir   string
+}
 
 // --- STRUCTS FOR PYPI & NPM PARSING ---
 
@@ -71,15 +74,15 @@ func normalizePEP503(name string) string {
 // fetchUpstream executes an HTTP request against an upstream registry.
 // No retry layer: every package manager (pip, npm, uv, yarn, pnpm) already
 // retries on its own, and stacking retries multiplies upstream load on outage.
-func fetchUpstream(client *http.Client, req *http.Request) (*http.Response, error) {
+func (p *Proxy) fetchUpstream(req *http.Request) (*http.Response, error) {
 	req.Header.Set("User-Agent", "shrimp-basket/1.0.0")
-	return client.Do(req)
+	return p.httpClient.Do(req)
 }
 
 // --- CORE FILTERING LOGIC ---
 
 // filterPyPIIndex filters a PEP 691 JSON simple index, preserving all unknown fields (PEP 740, etc.)
-func filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
+func (p *Proxy) filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 	var rawIndex map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawIndex); err != nil {
 		return nil, err
@@ -92,7 +95,7 @@ func filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 	// and skip this second upstream fetch to /json.
 	// Fetch publish dates from PyPI JSON API
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://pypi.org/pypi/%s/json", normPkg), nil)
-	resp, err := fetchUpstream(pypiClient, req)
+	resp, err := p.fetchUpstream(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch release dates (failing closed): %w", err)
 	}
@@ -188,8 +191,10 @@ func filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 	return json.Marshal(rawIndex)
 }
 
-// filterNPMIndex filters an NPM registry index, preserving all unknown fields
-func filterNPMIndex(pkg string, data []byte) ([]byte, error) {
+// filterNPMIndex filters an NPM registry index, preserving all unknown fields.
+// Pointer receiver kept for consistency with filterPyPIIndex so method values
+// of either can be assigned to the filterFunc variable in updatePackageCache.
+func (p *Proxy) filterNPMIndex(pkg string, data []byte) ([]byte, error) {
 	var rawIndex map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawIndex); err != nil {
 		return nil, err
@@ -283,7 +288,7 @@ func filterNPMIndex(pkg string, data []byte) ([]byte, error) {
 
 // --- HTTP SERVER HANDLERS ---
 
-func handlePyPI(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) handlePyPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -306,8 +311,8 @@ func handlePyPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	normPkg := normalizePEP503(pkg)
-	cacheFile := filepath.Join(cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
-	
+	cacheFile := filepath.Join(p.cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
+
 	// Check Cache
 	if data, err := readCache(cacheFile); err == nil {
 		servePyPICached(w, r, data)
@@ -315,12 +320,12 @@ func handlePyPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[FETCH] PyPI upstream index for: %s", normPkg)
-	
+
 	// Fetch from PyPI simple JSON endpoint
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://pypi.org/simple/%s/", normPkg), nil)
 	req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-	resp, err := fetchUpstream(pypiClient, req)
+	resp, err := p.fetchUpstream(req)
 	if err != nil {
 		log.Printf("Upstream PyPI request error: %v", err)
 		http.Error(w, "Gateway Error", http.StatusBadGateway)
@@ -344,7 +349,7 @@ func handlePyPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Filter and fail closed if filtering fails
-	filteredBody, err := filterPyPIIndex(normPkg, body)
+	filteredBody, err := p.filterPyPIIndex(normPkg, body)
 	if err != nil {
 		log.Printf("Filtering error (failing closed): %v", err)
 		http.Error(w, "Gateway Quarantine Error", http.StatusBadGateway)
@@ -370,7 +375,7 @@ func servePyPICached(w http.ResponseWriter, r *http.Request, data []byte) {
 	w.Write(data)
 }
 
-func handleNPM(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) handleNPM(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -401,7 +406,7 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheFile := filepath.Join(cacheDir, "npm", url.QueryEscape(pkg)+".json")
+	cacheFile := filepath.Join(p.cacheDir, "npm", url.QueryEscape(pkg)+".json")
 
 	// Check Cache
 	if data, err := readCache(cacheFile); err == nil {
@@ -423,7 +428,7 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 	}
 	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/"+upstreamPath, nil)
 
-	resp, err := fetchUpstream(npmClient, req)
+	resp, err := p.fetchUpstream(req)
 	if err != nil {
 		log.Printf("Upstream NPM request error: %v", err)
 		http.Error(w, "Gateway Error", http.StatusBadGateway)
@@ -446,7 +451,7 @@ func handleNPM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filteredBody, err := filterNPMIndex(pkg, body)
+	filteredBody, err := p.filterNPMIndex(pkg, body)
 	if err != nil {
 		log.Printf("NPM Filtering error (failing closed): %v", err)
 		http.Error(w, "Gateway Quarantine Error", http.StatusBadGateway)
@@ -491,35 +496,32 @@ func writeCache(cacheFile string, data []byte) {
 
 // --- DAILY UPDATE ROUTINE ---
 
-func runDailyUpdate() {
-	cacheDir = getCacheDir()
-	log.Printf("Starting daily metadata cache update in: %s", cacheDir)
+func (p *Proxy) runDailyUpdate() {
+	log.Printf("Starting daily metadata cache update in: %s", p.cacheDir)
 
-	// Update PyPI Cache
-	pypiFiles, _ := filepath.Glob(filepath.Join(cacheDir, "pypi", "*.json"))
+	pypiFiles, _ := filepath.Glob(filepath.Join(p.cacheDir, "pypi", "*.json"))
 	for _, file := range pypiFiles {
 		escapedPkg := strings.TrimSuffix(filepath.Base(file), ".json")
 		pkg, err := url.QueryUnescape(escapedPkg)
 		if err == nil {
-			updatePackageCache("pypi", pkg)
-			time.Sleep(50 * time.Millisecond) // Fast but rate-limited sleep
+			p.updatePackageCache("pypi", pkg)
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 
-	// Update NPM Cache
-	npmFiles, _ := filepath.Glob(filepath.Join(cacheDir, "npm", "*.json"))
+	npmFiles, _ := filepath.Glob(filepath.Join(p.cacheDir, "npm", "*.json"))
 	for _, file := range npmFiles {
 		escapedPkg := strings.TrimSuffix(filepath.Base(file), ".json")
 		pkg, err := url.QueryUnescape(escapedPkg)
 		if err == nil {
-			updatePackageCache("npm", pkg)
-			time.Sleep(50 * time.Millisecond) // Fast but rate-limited sleep
+			p.updatePackageCache("npm", pkg)
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 	log.Printf("Daily update complete.")
 }
 
-func updatePackageCache(registryType, pkg string) {
+func (p *Proxy) updatePackageCache(registryType, pkg string) {
 	log.Printf("[UPDATE] Fetching latest metadata for: %s (%s)", pkg, registryType)
 	var targetUrl string
 	var filterFunc func(string, []byte) ([]byte, error)
@@ -528,8 +530,8 @@ func updatePackageCache(registryType, pkg string) {
 	if registryType == "pypi" {
 		normPkg := normalizePEP503(pkg)
 		targetUrl = fmt.Sprintf("https://pypi.org/simple/%s/", normPkg)
-		filterFunc = filterPyPIIndex
-		cacheFile = filepath.Join(cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
+		filterFunc = p.filterPyPIIndex
+		cacheFile = filepath.Join(p.cacheDir, "pypi", url.QueryEscape(normPkg)+".json")
 	} else {
 		upstreamPath := pkg
 		if strings.Contains(pkg, "/") {
@@ -537,8 +539,8 @@ func updatePackageCache(registryType, pkg string) {
 			upstreamPath = parts[0] + "%2F" + parts[1]
 		}
 		targetUrl = "https://registry.npmjs.org/" + upstreamPath
-		filterFunc = filterNPMIndex
-		cacheFile = filepath.Join(cacheDir, "npm", url.QueryEscape(pkg)+".json")
+		filterFunc = p.filterNPMIndex
+		cacheFile = filepath.Join(p.cacheDir, "npm", url.QueryEscape(pkg)+".json")
 	}
 
 	req, _ := http.NewRequest("GET", targetUrl, nil)
@@ -546,14 +548,7 @@ func updatePackageCache(registryType, pkg string) {
 		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 	}
 
-	var resp *http.Response
-	var err error
-	if registryType == "pypi" {
-		resp, err = fetchUpstream(pypiClient, req)
-	} else {
-		resp, err = fetchUpstream(npmClient, req)
-	}
-
+	resp, err := p.fetchUpstream(req)
 	if err != nil {
 		log.Printf("Update request failed for %s: %v", pkg, err)
 		return
@@ -586,16 +581,18 @@ func main() {
 	updateFlag := flag.Bool("update", false, "Run daily update script and exit")
 	flag.Parse()
 
-	// Initialize cache dir location globally
-	cacheDir = getCacheDir()
+	p := &Proxy{
+		httpClient: &http.Client{Timeout: 15 * time.Second},
+		cacheDir:   getCacheDir(),
+	}
 
 	if *updateFlag {
-		runDailyUpdate()
+		p.runDailyUpdate()
 		return
 	}
 
 	log.Printf("[START] Starting shrimp-basket quarantine proxy...")
-	log.Printf("[START] Cache Directory: %s", cacheDir)
+	log.Printf("[START] Cache Directory: %s", p.cacheDir)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:"+defaultPort)
 	if err != nil {
@@ -604,8 +601,8 @@ func main() {
 	log.Printf("[START] Listening on 127.0.0.1:%s", defaultPort)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/simple/", handlePyPI)
-	mux.HandleFunc("/", handleNPM)
+	mux.HandleFunc("/simple/", p.handlePyPI)
+	mux.HandleFunc("/", p.handleNPM)
 
 	server := &http.Server{
 		Handler:      mux,
