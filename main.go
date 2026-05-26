@@ -480,17 +480,39 @@ func writeCache(cacheFile string, data []byte) {
 		return
 	}
 
-	os.MkdirAll(filepath.Dir(cacheFile), 0755)
-	
-	// Atomic Cache Write using temp file + Rename. Saves cache files with 0600 permissions.
-	tmpFile := cacheFile + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
-		log.Printf("Failed to write temporary cache: %v", err)
+	dir := filepath.Dir(cacheFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("Failed to create cache directory: %v", err)
 		return
 	}
-	if err := os.Rename(tmpFile, cacheFile); err != nil {
+
+	// Atomic cache write via unique temp file in the same directory + Rename.
+	// Unique names (vs cacheFile + ".tmp") avoid corruption when two requests
+	// for the same package race into writeCache concurrently.
+	tmp, err := os.CreateTemp(dir, "cache-*.tmp")
+	if err != nil {
+		log.Printf("Failed to create temporary cache file: %v", err)
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		log.Printf("Failed to chmod temporary cache: %v", err)
+		tmp.Close()
+		return
+	}
+	if _, err := tmp.Write(data); err != nil {
+		log.Printf("Failed to write temporary cache: %v", err)
+		tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		log.Printf("Failed to close temporary cache: %v", err)
+		return
+	}
+	if err := os.Rename(tmpName, cacheFile); err != nil {
 		log.Printf("Failed to commit cache atomically: %v", err)
-		os.Remove(tmpFile)
 	}
 }
 

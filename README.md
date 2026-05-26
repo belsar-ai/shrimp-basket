@@ -1,6 +1,6 @@
 # shrimp-basket
 
-A local, socket-activated Go quarantine proxy for PyPI and npmjs that mitigates supply chain attacks by filtering out package versions published within the last 7 days.
+A local Go quarantine proxy for PyPI and npmjs that mitigates supply chain attacks by filtering out package versions published within the last 7 days.
 
 ## How it works
 
