@@ -34,7 +34,8 @@ var (
 	npmNameRegex  = regexp.MustCompile(`^(@[A-Za-z0-9-_.]+/)?[A-Za-z0-9-_.]+$`)
 
 	// Single-flight lock for upstream requests. Entries in sync.Map are never
-	// removed; memory growth is bounded by total unique packages ever queried.
+	// removed, but growth is bounded by the count of unique packages ever
+	// queried — at ~50 bytes each, fine for a single-user proxy.
 	packageCacheLock sync.Map
 )
 
