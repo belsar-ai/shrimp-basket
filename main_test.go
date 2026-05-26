@@ -241,7 +241,9 @@ func TestFilterPyPIIndex(t *testing.T) {
 		t.Fatalf("filterPyPIIndex failed: %v", err)
 	}
 
-	var res PEP691Response
+	var res struct {
+		Files []PEP691File `json:"files"`
+	}
 	if err := json.Unmarshal(outputBytes, &res); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
