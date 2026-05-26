@@ -70,7 +70,7 @@ install: build
 		printf "[global]\nindex-url = http://127.0.0.1:12345/simple\n" > $(HOME)/.config/pip/pip.conf; \
 	fi
 
-	@printf "Installation successful! shrimp-basket is running via socket activation on port 12345.\n"
+	@printf "Installation successful! shrimp-basket is running as a systemd user service on port 12345.\n"
 
 uninstall:
 	@printf "==> Stopping and disabling systemd units...\n"
