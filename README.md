@@ -31,6 +31,24 @@ Read logs:
 ```bash
 journalctl --user -u shrimp-basket -f
 ```
+## Exceptions (Quarantine Bypass)
+
+If you need to install a trusted package version immediately without waiting for the 7-day quarantine to pass, you can add its registry project page URL to the exceptions list:
+
+* **Add an exception:**
+  ```bash
+  shrimp-basket --add-exception https://www.npmjs.com/package/@scope/pkg
+  ```
+* **Remove an exception:**
+  ```bash
+  shrimp-basket --remove-exception https://www.npmjs.com/package/@scope/pkg
+  ```
+* **List exceptions:**
+  ```bash
+  shrimp-basket --list-exceptions
+  ```
+
+Exceptions are persisted in `~/.config/shrimp-basket/exceptions.txt` and are loaded dynamically by the proxy service without requiring a restart.
 
 ## Uninstallation
 

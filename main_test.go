@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -276,4 +277,118 @@ func getMap(m map[string]interface{}, key string) map[string]interface{} {
 	var res map[string]interface{}
 	json.Unmarshal(b, &res)
 	return res
+}
+
+func TestBypassQuarantine(t *testing.T) {
+	t.Setenv("SHRIMP_EXCEPTIONS_FILE", filepath.Join(t.TempDir(), "none.txt"))
+	p := &Proxy{
+		npmBypassList: map[string]bool{
+			"@belsar-ai/joplin-mcp": true,
+		},
+		pypiBypassList: map[string]bool{
+			"exempt-pkg": true,
+		},
+	}
+
+	// 1. Check matched cases
+	if !p.isNPMBypassed("@belsar-ai/joplin-mcp") {
+		t.Errorf("expected @belsar-ai/joplin-mcp to be bypassed on NPM")
+	}
+	if !p.isPyPIBypassed("exempt-pkg") {
+		t.Errorf("expected exempt-pkg to be bypassed on PyPI")
+	}
+	if !p.isPyPIBypassed("Exempt_Pkg") { // matches normalized (exempt-pkg)
+		t.Errorf("expected Exempt_Pkg to match normalized name on PyPI")
+	}
+
+	// 2. Check non-matched cases
+	if p.isNPMBypassed("other-pkg") {
+		t.Errorf("expected other-pkg NOT to be bypassed on NPM")
+	}
+}
+
+func TestParseExceptionURL(t *testing.T) {
+	tests := []struct {
+		url      string
+		wantReg  string
+		wantPkg  string
+		wantFail bool
+	}{
+		{"https://www.npmjs.com/package/@belsar-ai/joplin-mcp", "npm", "@belsar-ai/joplin-mcp", false},
+		{"https://npmjs.com/package/express", "npm", "express", false},
+		{"https://pypi.org/project/pandas/", "pypi", "pandas", false},
+		{"https://pypi.org/project/requests", "pypi", "requests", false},
+		{"https://github.com/some/repo", "", "", true},
+		{"invalid-url", "", "", true},
+		// Invalid NPM cases
+		{"https://www.npmjs.com/package/express/v/1.0.0", "", "", true},
+		{"https://www.npmjs.com/package/@scope", "", "", true},
+		{"https://www.npmjs.com/package/@scope/", "", "", true},
+		// Invalid PyPI cases
+		{"https://pypi.org/project/pandas/subpath", "", "", true},
+	}
+
+	for _, tt := range tests {
+		reg, pkg, err := parseExceptionURL(tt.url)
+		if tt.wantFail {
+			if err == nil {
+				t.Errorf("expected URL %s to fail parsing, but it succeeded", tt.url)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("unexpected error parsing %s: %v", tt.url, err)
+			}
+			if reg != tt.wantReg || pkg != tt.wantPkg {
+				t.Errorf("parseExceptionURL(%s) = (%s, %s), want (%s, %s)", tt.url, reg, pkg, tt.wantReg, tt.wantPkg)
+			}
+		}
+	}
+}
+
+func TestExceptionsFileOperationsHermetic(t *testing.T) {
+	// Create a temporary file path
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "test_exceptions.txt")
+
+	// Set env var to override the config file path
+	t.Setenv("SHRIMP_EXCEPTIONS_FILE", tmpFile)
+
+	// 1. Verify initially it loads empty maps
+	npm, pypi, err := loadExceptions()
+	if err != nil {
+		t.Fatalf("loadExceptions failed: %v", err)
+	}
+	if len(npm) != 0 || len(pypi) != 0 {
+		t.Errorf("expected empty exceptions maps, got npm=%v pypi=%v", npm, pypi)
+	}
+
+	// 2. Add an exception
+	err = modifyException("https://www.npmjs.com/package/@belsar-ai/joplin-mcp", true)
+	if err != nil {
+		t.Fatalf("modifyException add failed: %v", err)
+	}
+
+	// 3. Load again and verify
+	npm, pypi, err = loadExceptions()
+	if err != nil {
+		t.Fatalf("loadExceptions failed: %v", err)
+	}
+	if !npm["@belsar-ai/joplin-mcp"] {
+		t.Errorf("expected npm package @belsar-ai/joplin-mcp to be bypassed")
+	}
+
+	// 4. Remove the exception
+	err = modifyException("https://www.npmjs.com/package/@belsar-ai/joplin-mcp", false)
+	if err != nil {
+		t.Fatalf("modifyException remove failed: %v", err)
+	}
+
+	// 5. Load again and verify
+	npm, pypi, err = loadExceptions()
+	if err != nil {
+		t.Fatalf("loadExceptions failed: %v", err)
+	}
+	if npm["@belsar-ai/joplin-mcp"] {
+		t.Errorf("expected npm package @belsar-ai/joplin-mcp NOT to be bypassed after removal")
+	}
 }

@@ -33,8 +33,32 @@ var (
 // by the registry handlers and the daily update routine. Tests construct
 // their own Proxy with a mock transport instead of mutating package globals.
 type Proxy struct {
-	httpClient *http.Client
-	cacheDir   string
+	httpClient     *http.Client
+	cacheDir       string
+	npmBypassList  map[string]bool
+	pypiBypassList map[string]bool
+}
+
+func (p *Proxy) isNPMBypassed(pkg string) bool {
+	if p.npmBypassList[strings.ToLower(pkg)] {
+		return true
+	}
+	fileNpm, _, err := loadExceptions()
+	if err != nil {
+		return false
+	}
+	return fileNpm[strings.ToLower(pkg)]
+}
+
+func (p *Proxy) isPyPIBypassed(pkg string) bool {
+	if p.pypiBypassList[normalizePEP503(pkg)] {
+		return true
+	}
+	_, filePypi, err := loadExceptions()
+	if err != nil {
+		return false
+	}
+	return filePypi[normalizePEP503(pkg)]
 }
 
 // --- STRUCTS FOR PYPI & NPM PARSING ---
@@ -67,6 +91,247 @@ func getCacheDir() string {
 	return filepath.Join(home, ".cache", "shrimp-basket")
 }
 
+func getExceptionsFilePath() string {
+	if envPath := os.Getenv("SHRIMP_EXCEPTIONS_FILE"); envPath != "" {
+		return envPath
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.Getenv("HOME")
+	}
+	return filepath.Join(home, ".config", "shrimp-basket", "exceptions.txt")
+}
+
+// parseExceptionURL parses a package URL and returns (registry, pkgName, err)
+// Supported domains: npmjs.com and pypi.org
+func parseExceptionURL(rawURL string) (registry string, pkgName string, err error) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", "", err
+	}
+
+	host := strings.ToLower(u.Host)
+	path := u.Path
+
+	if host == "npmjs.com" || host == "www.npmjs.com" {
+		// Expects /package/pkgName or /package/@scope/pkgName
+		const prefix = "/package/"
+		if !strings.HasPrefix(path, prefix) {
+			return "", "", fmt.Errorf("invalid npmjs URL path: %s (expected /package/...)", path)
+		}
+		pkg := strings.TrimPrefix(path, prefix)
+		pkg = strings.TrimSuffix(pkg, "/")
+		if pkg == "" {
+			return "", "", fmt.Errorf("missing package name in npmjs URL")
+		}
+		if strings.HasPrefix(pkg, "@") {
+			parts := strings.Split(pkg, "/")
+			if len(parts) != 2 || parts[1] == "" {
+				return "", "", fmt.Errorf("invalid scoped package format: %s (expected @scope/pkg)", pkg)
+			}
+		} else {
+			// Non-scoped NPM package name should not contain any slashes (e.g. reject express/v/1.0.0)
+			if strings.Contains(pkg, "/") {
+				return "", "", fmt.Errorf("invalid non-scoped package name: %s (cannot contain slashes)", pkg)
+			}
+		}
+		return "npm", pkg, nil
+	}
+
+	if host == "pypi.org" || host == "www.pypi.org" {
+		// Expects /project/pkgName/
+		const prefix = "/project/"
+		if !strings.HasPrefix(path, prefix) {
+			return "", "", fmt.Errorf("invalid pypi URL path: %s (expected /project/...)", path)
+		}
+		pkg := strings.TrimPrefix(path, prefix)
+		pkg = strings.TrimSuffix(pkg, "/")
+		if pkg == "" {
+			return "", "", fmt.Errorf("missing package name in pypi URL")
+		}
+		if strings.Contains(pkg, "/") {
+			return "", "", fmt.Errorf("invalid pypi package name: %s (cannot contain slashes)", pkg)
+		}
+		return "pypi", pkg, nil
+	}
+
+	return "", "", fmt.Errorf("unsupported registry domain: %s (only npmjs.com and pypi.org are supported)", host)
+}
+
+func loadExceptions() (map[string]bool, map[string]bool, error) {
+	path := getExceptionsFilePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+
+	npmBypass := make(map[string]bool)
+	pypiBypass := make(map[string]bool)
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		reg, pkg, err := parseExceptionURL(line)
+		if err != nil {
+			log.Printf("Warning: ignoring invalid exception URL '%s': %v", line, err)
+			continue
+		}
+		if reg == "npm" {
+			npmBypass[strings.ToLower(pkg)] = true
+		} else if reg == "pypi" {
+			pypiBypass[normalizePEP503(pkg)] = true
+		}
+	}
+	return npmBypass, pypiBypass, nil
+}
+
+func modifyException(rawURL string, add bool) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return fmt.Errorf("exception URL cannot be empty")
+	}
+
+	// Validate the URL format first
+	reg, pkg, err := parseExceptionURL(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid exception URL: %w", err)
+	}
+
+	// Normalize casing of URL based on registry conventions
+	var normalizedURL string
+	if reg == "npm" {
+		normalizedURL = fmt.Sprintf("https://www.npmjs.com/package/%s", strings.ToLower(pkg))
+	} else {
+		normalizedURL = fmt.Sprintf("https://pypi.org/project/%s/", normalizePEP503(pkg))
+	}
+
+	path := getExceptionsFilePath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	var lines []string
+	data, err := os.ReadFile(path)
+	if err == nil {
+		rawLines := strings.Split(string(data), "\n")
+		for _, line := range rawLines {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				lines = append(lines, line)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read exceptions file: %w", err)
+	}
+
+	found := false
+	var newLines []string
+	for _, line := range lines {
+		if strings.EqualFold(line, normalizedURL) {
+			found = true
+			if add {
+				newLines = append(newLines, line)
+			}
+		} else {
+			newLines = append(newLines, line)
+		}
+	}
+
+	if add && !found {
+		newLines = append(newLines, normalizedURL)
+		fmt.Printf("Adding '%s' to exceptions list...\n", normalizedURL)
+	} else if !add && found {
+		fmt.Printf("Removing '%s' from exceptions list...\n", normalizedURL)
+	} else if add && found {
+		fmt.Printf("'%s' is already in the exceptions list.\n", normalizedURL)
+		return nil
+	} else if !add && !found {
+		fmt.Printf("'%s' was not found in the exceptions list.\n", normalizedURL)
+		return nil
+	}
+
+	output := strings.Join(newLines, "\n")
+	if len(newLines) > 0 {
+		output += "\n"
+	}
+
+	// Atomic write using temp file and rename
+	tmp, err := os.CreateTemp(dir, "exceptions-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary config file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to chmod temporary config: %w", err)
+	}
+	if _, err := tmp.Write([]byte(output)); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to write temporary config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary config: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("failed to commit exceptions file atomically: %w", err)
+	}
+
+	fmt.Printf("Updated exceptions list saved to %s\n", path)
+
+	// Clear the cache file for this package so the proxy fetches the fresh index next time
+	cacheSubdir := "npm"
+	normalizedPkg := strings.ToLower(pkg)
+	if reg == "pypi" {
+		cacheSubdir = "pypi"
+		normalizedPkg = normalizePEP503(pkg)
+	}
+
+	cacheFile := filepath.Join(getCacheDir(), cacheSubdir, url.QueryEscape(normalizedPkg)+".json")
+	if err := os.Remove(cacheFile); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: failed to clear cache for %s: %v", pkg, err)
+	} else if err == nil {
+		fmt.Printf("Cleared cache for %s (%s)\n", pkg, reg)
+	}
+
+	return nil
+}
+
+func printExceptions() error {
+	path := getExceptionsFilePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("No exceptions configured.")
+			return nil
+		}
+		return fmt.Errorf("failed to read exceptions file: %w", err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	count := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			fmt.Println(line)
+			count++
+		}
+	}
+
+	if count == 0 {
+		fmt.Println("No exceptions configured.")
+	}
+	return nil
+}
+
 // normalizePEP503 normalizes a package name according to PEP 503
 func normalizePEP503(name string) string {
 	return strings.ToLower(normPattern.ReplaceAllString(name, "-"))
@@ -84,6 +349,10 @@ func (p *Proxy) fetchUpstream(req *http.Request) (*http.Response, error) {
 
 // filterPyPIIndex filters a PEP 691 JSON simple index, preserving all unknown fields (PEP 740, etc.)
 func (p *Proxy) filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
+	if p.isPyPIBypassed(pkg) {
+		log.Printf("[BYPASS] PyPI package %s is on the bypass list", pkg)
+		return data, nil
+	}
 	var rawIndex map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawIndex); err != nil {
 		return nil, err
@@ -196,6 +465,10 @@ func (p *Proxy) filterPyPIIndex(pkg string, data []byte) ([]byte, error) {
 // Pointer receiver kept for consistency with filterPyPIIndex so method values
 // of either can be assigned to the filterFunc variable in updatePackageCache.
 func (p *Proxy) filterNPMIndex(pkg string, data []byte) ([]byte, error) {
+	if p.isNPMBypassed(pkg) {
+		log.Printf("[BYPASS] NPM package %s is on the bypass list", pkg)
+		return data, nil
+	}
 	var rawIndex map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawIndex); err != nil {
 		return nil, err
@@ -656,11 +929,67 @@ func main() {
 	updateFlag := flag.Bool("update", false, "Run daily update script and exit")
 	cacheSizeFlag := flag.Bool("cache-size", false, "Print cache size and exit")
 	cacheCleanFlag := flag.Bool("cache-clean", false, "Delete all cached metadata and exit")
+	bypassFlag := flag.String("bypass", "", "Comma-separated list of package page URLs to bypass quarantine (e.g. 'https://www.npmjs.com/package/@belsar-ai/joplin-mcp')")
+	addException := flag.String("add-exception", "", "Add a package URL to the quarantine bypass list (e.g. 'https://pypi.org/project/pandas/')")
+	removeException := flag.String("remove-exception", "", "Remove a package URL from the quarantine bypass list")
+	listExceptions := flag.Bool("list-exceptions", false, "List all package URLs in the quarantine bypass list")
 	flag.Parse()
 
+	if *addException != "" {
+		if err := modifyException(*addException, true); err != nil {
+			log.Fatalf("Error adding exception: %v", err)
+		}
+		return
+	}
+
+	if *removeException != "" {
+		if err := modifyException(*removeException, false); err != nil {
+			log.Fatalf("Error removing exception: %v", err)
+		}
+		return
+	}
+
+	if *listExceptions {
+		if err := printExceptions(); err != nil {
+			log.Fatalf("Error listing exceptions: %v", err)
+		}
+		return
+	}
+
+	bypassEnv := os.Getenv("SHRIMP_BYPASS")
+	bypassVal := *bypassFlag
+	if bypassVal == "" {
+		bypassVal = bypassEnv
+	}
+
+	npmBypass := make(map[string]bool)
+	pypiBypass := make(map[string]bool)
+
+	// Parse bypass CLI flag / Environment variable
+	if bypassVal != "" {
+		for _, item := range strings.Split(bypassVal, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			reg, pkg, err := parseExceptionURL(item)
+			if err != nil {
+				log.Printf("Warning: invalid bypass URL '%s': %v", item, err)
+				continue
+			}
+			if reg == "npm" {
+				npmBypass[strings.ToLower(pkg)] = true
+			} else if reg == "pypi" {
+				pypiBypass[normalizePEP503(pkg)] = true
+			}
+		}
+	}
+
 	p := &Proxy{
-		httpClient: &http.Client{Timeout: 15 * time.Second},
-		cacheDir:   getCacheDir(),
+		httpClient:     &http.Client{Timeout: 15 * time.Second},
+		cacheDir:       getCacheDir(),
+		npmBypassList:  npmBypass,
+		pypiBypassList: pypiBypass,
 	}
 
 	if *updateFlag {
