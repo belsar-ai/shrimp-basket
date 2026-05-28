@@ -92,6 +92,9 @@ func getCacheDir() string {
 }
 
 func getExceptionsFilePath() string {
+	if envPath := os.Getenv("SHRIMP_EXCEPTIONS_FILE"); envPath != "" {
+		return envPath
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = os.Getenv("HOME")
@@ -125,6 +128,11 @@ func parseExceptionURL(rawURL string) (registry string, pkgName string, err erro
 			parts := strings.Split(pkg, "/")
 			if len(parts) != 2 || parts[1] == "" {
 				return "", "", fmt.Errorf("invalid scoped package format: %s (expected @scope/pkg)", pkg)
+			}
+		} else {
+			// Non-scoped NPM package name should not contain any slashes (e.g. reject express/v/1.0.0)
+			if strings.Contains(pkg, "/") {
+				return "", "", fmt.Errorf("invalid non-scoped package name: %s (cannot contain slashes)", pkg)
 			}
 		}
 		return "npm", pkg, nil

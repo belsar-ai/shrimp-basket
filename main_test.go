@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -318,6 +319,12 @@ func TestParseExceptionURL(t *testing.T) {
 		{"https://pypi.org/project/requests", "pypi", "requests", false},
 		{"https://github.com/some/repo", "", "", true},
 		{"invalid-url", "", "", true},
+		// Invalid NPM cases
+		{"https://www.npmjs.com/package/express/v/1.0.0", "", "", true},
+		{"https://www.npmjs.com/package/@scope", "", "", true},
+		{"https://www.npmjs.com/package/@scope/", "", "", true},
+		// Invalid PyPI cases
+		{"https://pypi.org/project/pandas/subpath", "", "", true},
 	}
 
 	for _, tt := range tests {
@@ -334,5 +341,53 @@ func TestParseExceptionURL(t *testing.T) {
 				t.Errorf("parseExceptionURL(%s) = (%s, %s), want (%s, %s)", tt.url, reg, pkg, tt.wantReg, tt.wantPkg)
 			}
 		}
+	}
+}
+
+func TestExceptionsFileOperationsHermetic(t *testing.T) {
+	// Create a temporary file path
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "test_exceptions.txt")
+
+	// Set env var to override the config file path
+	t.Setenv("SHRIMP_EXCEPTIONS_FILE", tmpFile)
+
+	// 1. Verify initially it loads empty maps
+	npm, pypi, err := loadExceptions()
+	if err != nil {
+		t.Fatalf("loadExceptions failed: %v", err)
+	}
+	if len(npm) != 0 || len(pypi) != 0 {
+		t.Errorf("expected empty exceptions maps, got npm=%v pypi=%v", npm, pypi)
+	}
+
+	// 2. Add an exception
+	err = modifyException("https://www.npmjs.com/package/@belsar-ai/joplin-mcp", true)
+	if err != nil {
+		t.Fatalf("modifyException add failed: %v", err)
+	}
+
+	// 3. Load again and verify
+	npm, pypi, err = loadExceptions()
+	if err != nil {
+		t.Fatalf("loadExceptions failed: %v", err)
+	}
+	if !npm["@belsar-ai/joplin-mcp"] {
+		t.Errorf("expected npm package @belsar-ai/joplin-mcp to be bypassed")
+	}
+
+	// 4. Remove the exception
+	err = modifyException("https://www.npmjs.com/package/@belsar-ai/joplin-mcp", false)
+	if err != nil {
+		t.Fatalf("modifyException remove failed: %v", err)
+	}
+
+	// 5. Load again and verify
+	npm, pypi, err = loadExceptions()
+	if err != nil {
+		t.Fatalf("loadExceptions failed: %v", err)
+	}
+	if npm["@belsar-ai/joplin-mcp"] {
+		t.Errorf("expected npm package @belsar-ai/joplin-mcp NOT to be bypassed after removal")
 	}
 }
