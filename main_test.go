@@ -280,6 +280,7 @@ func getMap(m map[string]interface{}, key string) map[string]interface{} {
 }
 
 func TestBypassQuarantine(t *testing.T) {
+	t.Setenv("SHRIMP_EXCEPTIONS_FILE", filepath.Join(t.TempDir(), "none.txt"))
 	p := &Proxy{
 		npmBypassList: map[string]bool{
 			"@belsar-ai/joplin-mcp": true,
